@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
 
 	otkkubectl "github.com/darkowlzz/operator-toolkit/declarative/kubectl"
 	"github.com/replicatedhq/troubleshoot/cmd/util"
@@ -160,7 +159,11 @@ func (in *Installer) Install() error {
 		if err != nil {
 			return err
 		}
-		time.Sleep(5 * time.Second)
+		err = in.operatorDeploymentsAreReady(filepath.Join(etcdDir, operatorDir, etcdOperatorFile))
+		if err != nil {
+			return err
+		}
+
 		err = in.kustomizeAndApply(filepath.Join(etcdDir, clusterDir))
 		if err != nil {
 			return err
@@ -195,7 +198,7 @@ func (in *Installer) Install() error {
 	if err != nil {
 		return err
 	}
-	err = in.stosOperatorIsReady(stosOperatorNS)
+	err = in.operatorDeploymentsAreReady(filepath.Join(stosDir, operatorDir, stosOperatorFile))
 	if err != nil {
 		return err
 	}
@@ -207,27 +210,36 @@ func (in *Installer) Install() error {
 	return nil
 }
 
-func (in *Installer) stosOperatorIsReady(stosOperatorNS string) error {
-	if stosOperatorNS == "" {
-		stosOperatorNS = defaultStosOperatorNS
+// operatorDeploymentsAreReady takes the path of an operator manifest and returns no error if all
+// deployments in the manifest have the desired number of ready replicas
+func (in *Installer) operatorDeploymentsAreReady(path string) error {
+	operatorDeployments, err := in.getAllManifestsOfKindFromFsMultiDoc(path, "Deployment")
+	if err != nil {
+		return err
 	}
+
 	config, err := pluginutils.NewClientConfig()
 	if err != nil {
 		return err
 	}
-	stosOperatorDeployment, err := in.getManifestFromFsMultiDoc(filepath.Join(stosDir, operatorDir, stosOperatorFile), "Deployment")
-	if err != nil {
-		return err
-	}
-	stosOperatorName, err := pluginutils.GetFieldInManifest(stosOperatorDeployment, "metadata", "name")
-	if err != nil {
-		return err
-	}
-	err = pluginutils.DeploymentIsReady(config, stosOperatorName, stosOperatorNS, 90, 5)
-	if err != nil {
-		return err
+	for _, deployment := range operatorDeployments {
+		deploymentName, err := pluginutils.GetFieldInManifest(deployment, "metadata", "name")
+		if err != nil {
+			return err
+		}
+		deploymentNamespace, err := pluginutils.GetFieldInManifest(deployment, "metadata", "namespace")
+		if err != nil {
+			return err
+		}
+		err = pluginutils.WaitFor(func() error {
+			return pluginutils.DeploymentIsReady(config, deploymentName, deploymentNamespace)
+		}, 90, 5)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
+
 }
 
 func (in *Installer) addPatchesToFSKustomize(path, targetKind, targetName string, patches []pluginutils.KustomizePatch) error {
@@ -499,4 +511,18 @@ func (in *Installer) getManifestFromFsMultiDoc(path, kind string) (string, error
 		return "", err
 	}
 	return singleManifest, nil
+}
+
+// getAllManifestsOfKindFromFsMultiDoc reads the file at path of the in-memory filesystem, uses
+// GetManifestFromMultiDoc internally to retrieve all manifests ok 'kind'.
+func (in *Installer) getAllManifestsOfKindFromFsMultiDoc(path, kind string) ([]string, error) {
+	data, err := in.fileSys.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	manifests, err := pluginutils.GetAllManifestsOfKindFromMultiDoc(string(data), kind)
+	if err != nil {
+		return nil, err
+	}
+	return manifests, nil
 }
